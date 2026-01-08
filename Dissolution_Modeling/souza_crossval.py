@@ -13,7 +13,7 @@ import torch.nn.functional as F
 # -------------------------
 # CONFIG
 # -------------------------
-CSV_PATH = "./Souza2025_TableS1_long_fraction_norm_onehot.csv"
+CSV_PATH = "./Souza2025_TableS1_Final_Pruned.csv"
 
 SEED = 42
 DEVICE = "cpu"
@@ -35,11 +35,11 @@ GRAD_CLIP = 5.0
 LOG_EVERY = 10  # epoch logging frequency
 
 # GRID SEARCH: hyperparameter ranges
-HIDDEN_SIZES = list(range(8, 14))       # 5..20 inclusive
+HIDDEN_SIZES = list(range(10, 13))       # 5..20 inclusive
 N_HIDDEN_LAYERS = [1, 2, 3]
 ACTIVATIONS = ["relu","tanh"]
-LEARNING_RATES = [1e-2, 5e-3]  # change if desired
-DROPOUTS = [0.0, 0.1]
+LEARNING_RATES = [1e-2]  # change if desired
+DROPOUTS = [0.0]
 
 # features already in cleaned CSV
 CONT_COLS = ["PEO_N750_pct", "PEO_1105_pct", "PEO_N60K_pct", "PEO_303_pct", "Diluent_pct"]
@@ -52,7 +52,7 @@ TIME_COL  = "time_min"
 Y_COL     = "release_frac"
 
 # Optional: still recommended for MLP training stability
-STANDARDIZE_CONT = False
+STANDARDIZE_CONT = True
 
 # outputs
 TRIALS_CSV = "souza_clean_gridsearch_trials.csv"

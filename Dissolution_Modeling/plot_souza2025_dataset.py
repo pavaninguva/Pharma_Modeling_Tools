@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 # -----------------------------
 # User settings
 # -----------------------------
-CSV_PATH = "./Souza2025_TableS1_long_fraction.csv"
+CSV_PATH = "./Souza2025_TableS1_Final.csv"
 OUT_PATH = "./souza2025_dissolution.png"
 
 N_PANELS = 10
