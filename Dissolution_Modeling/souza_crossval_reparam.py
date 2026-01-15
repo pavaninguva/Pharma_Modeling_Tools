@@ -50,7 +50,7 @@ ODE_ATOL = 1e-8
 N_FIXED = 1.0
 
 # training
-MAX_EPOCHS = 300
+MAX_EPOCHS = 400
 PATIENCE = 40
 BATCH_SIZE = 64
 WEIGHT_DECAY = 1e-6
@@ -58,7 +58,7 @@ GRAD_CLIP = 5.0
 LOG_EVERY = 10  # epoch logging frequency
 
 # GRID SEARCH: hyperparameter ranges
-HIDDEN_SIZES = list(range(11, 16))
+HIDDEN_SIZES = list(range(10, 15))
 N_HIDDEN_LAYERS = [3, 4, 5]
 ACTIVATIONS = ["relu", "tanh", "swish", "softplus", "leakyrelu", "gelu"]
 LEARNING_RATES = [1e-2, 2e-2, 3e-2]
@@ -309,9 +309,9 @@ class DissolutionODEFunc(nn.Module):
 
 def odeint_solve_batch(lam, tau, beta, t_eval, device,
                        method=ODE_METHOD, rtol=ODE_RTOL, atol=ODE_ATOL):
-    t = torch.tensor(np.asarray(t_eval, dtype=float), device=device, dtype=torch.float32)
+    t = torch.tensor(np.asarray(t_eval, dtype=float), device=device, dtype=torch.float64)
     B = lam.shape[0]
-    y0 = torch.zeros(B, device=device, dtype=torch.float32)
+    y0 = torch.zeros(B, device=device, dtype=torch.float64)
 
     func = DissolutionODEFunc(lam, tau, beta, n_fixed=N_FIXED)
     y = odeint(func, y0, t, method=method, rtol=rtol, atol=atol)  # [T, B]
