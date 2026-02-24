@@ -2,21 +2,20 @@
 """
 Neural ODE parameter learning for dissolution curves using torchdiffeq (Dopri5).
 
-This version adds `standardize_cont` as a grid-search hyperparameter (True/False),
-and includes it as an axis in the parallel-coordinates plot.
-
-Key points:
-- Fix n = 1 globally (NOT learned).
-- NN predicts only (lambda, tau, beta).
-- ODE solution computed with torchdiffeq.odeint using method="dopri5".
-- Standardization (if enabled) is applied *within each CV fold* using ONLY that
-  fold's training indices (avoids leakage into validation).
+Updates (v2):
+1) Diluent can be encoded as:
+   - "onehot"      : (Diluent_pct + one-hot diluent type indicators)  [current behavior]
+   - "continuous"  : per-diluent concentration features (Diluent_*_pct) [NEW]
+2) Trials CSV now records "diluent_encoding" so you can mix result sets safely.
+   Existing CSVs without that column are assumed to be "onehot".
+3) Parallel coordinates plot includes "diluent_encoding".
+4) Add a switch to skip HPO and only regenerate the parallel coordinates plot.
 
 Requires:
-    pip install torchdiffeq
+    pip install torchdiffeq optuna
 """
 
-import os, re, math, time, itertools
+import os, re, math, time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -28,13 +27,16 @@ import torch.nn.functional as F
 
 from torchdiffeq import odeint
 
+import optuna
+from optuna.samplers import TPESampler
+
 
 # -------------------------
 # CONFIG
 # -------------------------
-CSV_PATH = "./Souza2025_TableS1_Final.csv"
+CSV_PATH = "./Souza2025_TableS1_Final_v2_diluent_continuous.csv"  # <--- use updated dataset CSV
 
-SEED = 42
+SEED = 1
 DEVICE = "cpu"  # "cuda" if available
 
 # leakage-safe outer split
@@ -50,24 +52,60 @@ ODE_ATOL = 1e-8
 N_FIXED = 1.0
 
 # training
-MAX_EPOCHS = 400
-PATIENCE = 40
-BATCH_SIZE = 64
+MAX_EPOCHS = 700
+PATIENCE = 100
+BATCH_SIZE = 32
 WEIGHT_DECAY = 1e-6
 GRAD_CLIP = 5.0
-LOG_EVERY = 10  # epoch logging frequency
+LOG_EVERY = 10
 
-# GRID SEARCH: hyperparameter ranges
-HIDDEN_SIZES = list(range(10, 15))
+# LR scheduler (ReduceLROnPlateau)
+USE_SCHEDULER = True
+SCHED_FACTOR = 0.9
+SCHED_PATIENCE = 50
+SCHED_MIN_LR = 1e-6
+SCHED_COOLDOWN = 0
+
+# Optimizer toggle
+OPTIMIZER_TYPE = "adamw"  # "adam" or "adamw"
+
+# Loss/metric toggle
+LOSS_MODE = "absolute"   # "relative" or "absolute"
+REL_EPS = 1e-3  # used only if LOSS_MODE="relative"
+
+# Diluent encoding toggle (NEW)
+# - "onehot": uses Diluent_pct + (Diluent_G721, Diluent_SMCC, Diluent_MD_IT12)
+# - "continuous": uses (Diluent_G721_pct, Diluent_SMCC_pct, Diluent_MD_IT12_pct)
+DILUENT_ENCODING = "continuous"  # <--- set to "continuous" to use per-diluent concentrations
+
+# Run mode (NEW)
+# If False, skip Optuna HPO and only regenerate the parallel coordinates plot from TRIALS_CSV.
+RUN_HPO = True
+
+# BAYESIAN OPT (Optuna) settings
+N_TRIALS = 150
+OPTUNA_STORAGE = "sqlite:///souza_optuna_neuralode.db"
+# IMPORTANT: set study name per encoding to avoid "dynamic value space" issues if you switch modes.
+OPTUNA_STUDY_NAME = f"souza_neuralode_hpo_{DILUENT_ENCODING}"
+USE_PRUNER = False
+
+# SEARCH SPACE
+HIDDEN_SIZE_MIN = 12
+HIDDEN_SIZE_MAX = 64
+HIDDEN_SIZE_STEP = 1
+
 N_HIDDEN_LAYERS = [3, 4, 5]
-ACTIVATIONS = ["relu", "tanh", "swish", "softplus", "leakyrelu", "gelu"]
-LEARNING_RATES = [1e-2, 2e-2, 3e-2]
-DROPOUTS = [0.0, 0.1]
-STANDARDIZE_OPTIONS = [True]  
+ACTIVATIONS = ["swish", "leakyrelu", "gelu", "mish"]  # keep stable if resuming an existing study
+DROPOUTS = [0.0, 0.1, 0.2]
+STANDARDIZE_OPTIONS = [True]
+LR_MIN = 1e-3
+LR_MAX = 5e-2
 
-# features already in cleaned CSV
-CONT_COLS = ["PEO_N750_pct", "PEO_1105_pct", "PEO_N60K_pct", "PEO_303_pct", "Diluent_pct"]
+# feature columns in CSV
+BASE_CONT_COLS = ["PEO_N750_pct", "PEO_1105_pct", "PEO_N60K_pct", "PEO_303_pct"]
+DILUENT_PCT_COL = "Diluent_pct"
 ONEHOT_COLS = ["Diluent_G721", "Diluent_SMCC", "Diluent_MD_IT12"]
+DILUENT_CONT_COLS = ["Diluent_G721_pct", "Diluent_SMCC_pct", "Diluent_MD_IT12_pct"]
 
 # keys
 BATCH_COL = "BatchID"
@@ -98,13 +136,32 @@ def natural_key(batch_id: str):
     return int(m.group(1)) if m else 10**9
 
 
+def get_feature_spec():
+    """
+    Returns (cont_cols, cat_cols, diluent_encoding_tag).
+    cont_cols are standardized when standardize_cont=True.
+    """
+    enc = str(DILUENT_ENCODING).strip().lower()
+    if enc == "onehot":
+        cont_cols = BASE_CONT_COLS + [DILUENT_PCT_COL]
+        cat_cols  = ONEHOT_COLS
+        return cont_cols, cat_cols, "onehot"
+    if enc in ("continuous", "cont", "gated"):
+        cont_cols = BASE_CONT_COLS + DILUENT_CONT_COLS
+        cat_cols  = []
+        return cont_cols, cat_cols, "continuous"
+    raise ValueError("DILUENT_ENCODING must be 'onehot' or 'continuous'.")
+
+
 # -------------------------
 # DATA: aggregate to one row per BatchID
 # -------------------------
 def load_aggregated(csv_path: str):
     df = pd.read_csv(csv_path)
 
-    needed = {BATCH_COL, CAT_COL, TIME_COL, Y_COL, *CONT_COLS, *ONEHOT_COLS}
+    cont_cols, cat_cols, _ = get_feature_spec()
+
+    needed = {BATCH_COL, CAT_COL, TIME_COL, Y_COL, *cont_cols, *cat_cols}
     missing = needed - set(df.columns)
     if missing:
         raise ValueError(f"Missing columns in CSV: {missing}")
@@ -118,9 +175,14 @@ def load_aggregated(csv_path: str):
         if not np.allclose(dfi[TIME_COL].to_numpy(dtype=float), t_eval):
             raise ValueError(f"Time grid mismatch for BatchID={bid}")
 
-        x_cont = dfi.iloc[0][CONT_COLS].to_numpy(dtype=float)
-        x_oh   = dfi.iloc[0][ONEHOT_COLS].to_numpy(dtype=float)
-        X_list.append(np.concatenate([x_cont, x_oh], axis=0))
+        x_cont = dfi.iloc[0][cont_cols].to_numpy(dtype=float)
+        if len(cat_cols) > 0:
+            x_cat = dfi.iloc[0][cat_cols].to_numpy(dtype=float)
+            x = np.concatenate([x_cont, x_cat], axis=0)
+        else:
+            x = x_cont
+
+        X_list.append(x)
         Y_list.append(dfi[Y_COL].to_numpy(dtype=float))
         labels.append(str(dfi.iloc[0][CAT_COL]))
         groups.append(bid)
@@ -224,6 +286,7 @@ def stratified_folds(labels, k=5, seed=0, max_tries=20000):
 def standardize_cont_fold(X, cont_dim, train_idx):
     """
     Returns (Xs, mu, sd) where mu/sd are computed using ONLY train_idx.
+    Assumes continuous features are the first cont_dim columns of X.
     """
     Xs = X.copy()
     mu = Xs[train_idx, :cont_dim].mean(axis=0, keepdims=True)
@@ -248,11 +311,13 @@ class ParamNet(nn.Module):
         elif activation == "softplus":
             act = lambda: nn.Softplus(beta=1.0, threshold=20.0)
         elif activation in ("swish", "silu"):
-            act = nn.SiLU  # Swish
+            act = nn.SiLU
         elif activation == "leakyrelu":
             act = nn.LeakyReLU
         elif activation == "gelu":
             act = nn.GELU
+        elif activation == "mish":
+            act = nn.Mish
         else:
             raise ValueError(f"Unknown activation='{activation}'.")
 
@@ -272,9 +337,10 @@ class ParamNet(nn.Module):
 
     def forward(self, x):
         z = self.out(self.body(x))
-        lam  = torch.exp(torch.clamp(z[:, 0], -10.0,  4.0))  # >0
-        tau  = torch.exp(torch.clamp(z[:, 1], -10.0,  4.0))  # >0
-        beta = F.softplus(torch.clamp(z[:, 2], -5.0,  2.0))   # >0
+        # Keep your original parameterization here; you can switch to softplus-based mapping if desired.
+        lam  = torch.exp(torch.clamp(z[:, 0], -10.0,  10.0))  # >0
+        tau  = torch.exp(torch.clamp(z[:, 1], -10.0,  10.0))  # >0
+        beta = F.softplus(torch.clamp(z[:, 2], -5.0,  5.0))   # >0
         return lam, tau, beta
 
 
@@ -319,20 +385,68 @@ def odeint_solve_batch(lam, tau, beta, t_eval, device,
     return torch.clamp(y, 0.0, 1.0)
 
 
-def curve_mse(pred, target):
+# -------------------------
+# LOSS: Relative or Absolute curve MSE (switchable)
+# -------------------------
+def curve_mse_relative(pred, target, rel_eps=REL_EPS):
+    target = target.to(dtype=pred.dtype)
+    denom = torch.clamp(target, min=float(rel_eps))
+    rel_err = (pred - target) / denom
+    return (rel_err ** 2).mean(dim=1).mean()
+
+
+def curve_mse_absolute(pred, target):
+    target = target.to(dtype=pred.dtype)
     return ((pred - target) ** 2).mean(dim=1).mean()
+
+
+def get_curve_mse():
+    mode = str(LOSS_MODE).strip().lower()
+    if mode in ("relative", "rel", "rel_mse", "rel-mse"):
+        return lambda pred, target: curve_mse_relative(pred, target, rel_eps=REL_EPS), "REL"
+    if mode in ("absolute", "abs", "abs_mse", "abs-mse"):
+        return lambda pred, target: curve_mse_absolute(pred, target), "ABS"
+    raise ValueError("LOSS_MODE must be 'relative' or 'absolute'.")
+
+
+# -------------------------
+# OPTIMIZER / SCHEDULER builders
+# -------------------------
+def build_optimizer(model: nn.Module, lr: float):
+    opt_name = str(OPTIMIZER_TYPE).strip().lower()
+    if opt_name == "adam":
+        return torch.optim.Adam(model.parameters(), lr=float(lr), weight_decay=float(WEIGHT_DECAY))
+    elif opt_name == "adamw":
+        return torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(WEIGHT_DECAY))
+    else:
+        raise ValueError(f"Unknown OPTIMIZER_TYPE='{OPTIMIZER_TYPE}'. Use 'adam' or 'adamw'.")
+
+
+def build_scheduler(optimizer: torch.optim.Optimizer):
+    if not bool(USE_SCHEDULER):
+        return None
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=float(SCHED_FACTOR),
+        patience=int(SCHED_PATIENCE),
+        threshold=1e-6,
+        threshold_mode="rel",
+        cooldown=int(SCHED_COOLDOWN),
+        min_lr=float(SCHED_MIN_LR),
+        verbose=False,
+    )
 
 
 # -------------------------
 # TRAIN one fold (with fold-safe standardization)
 # -------------------------
 def train_one_fold(X_raw_train, Y_train, t_eval, train_idx, val_idx, hp,
-                   fold_id, config_id, verbose_epochs=False):
-    # fold-safe standardization toggle
+                   fold_id, config_id, cont_dim, verbose_epochs=False):
+    curve_mse_fn, metric_tag = get_curve_mse()
+
     if bool(hp["standardize_cont"]):
-        X_fold, _, _ = standardize_cont_fold(
-            X_raw_train, cont_dim=len(CONT_COLS), train_idx=train_idx
-        )
+        X_fold, _, _ = standardize_cont_fold(X_raw_train, cont_dim=cont_dim, train_idx=train_idx)
     else:
         X_fold = X_raw_train
 
@@ -349,7 +463,8 @@ def train_one_fold(X_raw_train, Y_train, t_eval, train_idx, val_idx, hp,
         dropout=hp["dropout"],
     ).to(DEVICE)
 
-    opt = torch.optim.Adam(model.parameters(), lr=hp["lr"], weight_decay=WEIGHT_DECAY)
+    opt = build_optimizer(model, lr=hp["lr"])
+    scheduler = build_scheduler(opt)
 
     best_val = float("inf")
     best_state = None
@@ -370,9 +485,8 @@ def train_one_fold(X_raw_train, Y_train, t_eval, train_idx, val_idx, hp,
 
             try:
                 pred = odeint_solve_batch(lam, tau, beta, t_eval, DEVICE)
-                loss = curve_mse(pred, yb)
+                loss = curve_mse_fn(pred, yb)
             except Exception as e:
-                # IMPORTANT: keep a grad connection so backward() doesn't crash
                 if verbose_epochs and (epoch == 1 or epoch % LOG_EVERY == 0):
                     print(f"      [warn] odeint failed (epoch {epoch}): {type(e).__name__}: {e}", flush=True)
                 loss = torch.tensor(1e3, device=DEVICE, dtype=torch.float32) + 0.0 * (
@@ -392,15 +506,21 @@ def train_one_fold(X_raw_train, Y_train, t_eval, train_idx, val_idx, hp,
             lam, tau, beta = model(Xva)
             try:
                 pred = odeint_solve_batch(lam, tau, beta, t_eval, DEVICE)
-                val = float(curve_mse(pred, Yva).item())
+                val = float(curve_mse_fn(pred, Yva).item())
             except Exception:
                 val = float("inf")
 
+        if scheduler is not None:
+            scheduler.step(val)
+
+        cur_lr = float(opt.param_groups[0]["lr"])
+
         if verbose_epochs and (epoch == 1 or epoch % LOG_EVERY == 0):
+            sched_tag = "on" if scheduler is not None else "off"
             print(
                 f"      cfg={config_id} fold={fold_id} epoch={epoch:03d} "
-                f"train_mse~{last_loss:.6f} val_mse={val:.6f} best_val={best_val:.6f} "
-                f"elapsed={time.time()-t0:.1f}s",
+                f"train_{metric_tag}_mse~{last_loss:.6f} val_{metric_tag}_mse={val:.6f} best_val_{metric_tag}_mse={best_val:.6f} "
+                f"lr={cur_lr:.3g} sched={sched_tag} opt={OPTIMIZER_TYPE} elapsed={time.time()-t0:.1f}s",
                 flush=True
             )
 
@@ -412,7 +532,11 @@ def train_one_fold(X_raw_train, Y_train, t_eval, train_idx, val_idx, hp,
             bad += 1
             if bad >= PATIENCE:
                 if verbose_epochs:
-                    print(f"      cfg={config_id} fold={fold_id} early-stop at epoch={epoch}", flush=True)
+                    print(
+                        f"      cfg={config_id} fold={fold_id} early-stop at epoch={epoch} "
+                        f"(lr={cur_lr:.3g} sched={'on' if scheduler is not None else 'off'})",
+                        flush=True
+                    )
                 break
 
     if best_state is not None:
@@ -435,18 +559,23 @@ def parallel_coordinates_plot(df_trials, out_png):
     LW_THIN = 0.8
     LW_THICK = 2.0
     TOP_N_THICK = 5
+    TOP_K_PLOT = 100
 
-    TOP_K_PLOT = 100  # <-- set K here
+    # Back-compat defaults
+    if "standardize_cont" not in dfp.columns:
+        dfp["standardize_cont"] = True
+    if "loss_mode" not in dfp.columns:
+        dfp["loss_mode"] = "relative"
+    if "diluent_encoding" not in dfp.columns:
+        dfp["diluent_encoding"] = "onehot"
 
     if "mean_rmse" not in dfp.columns:
         raise ValueError("df_trials must contain 'mean_rmse' to select top-K.")
+
     dfp = dfp.sort_values("mean_rmse", ascending=True).head(min(TOP_K_PLOT, len(dfp))).reset_index(drop=True)
 
-    # Backward compatibility: older CSVs might not have this column.
-    if "standardize_cont" not in dfp.columns:
-        dfp["standardize_cont"] = True
-
     required_cols = {
+        "diluent_encoding",
         "hidden_size", "n_hidden_layers", "activation", "dropout",
         "standardize_cont", "lr", "mean_rmse", "std_rmse"
     }
@@ -454,18 +583,25 @@ def parallel_coordinates_plot(df_trials, out_png):
     if missing:
         raise ValueError(f"df_trials missing required columns: {missing}")
 
-    # activation categorical mapping
-    act_levels_present = sorted(dfp["activation"].astype(str).unique().tolist())
-    if len(act_levels_present) == 1:
-        act_to_y = {act_levels_present[0]: 0.5}
+    # categorical maps
+    act_levels = sorted(dfp["activation"].astype(str).unique().tolist())
+    if len(act_levels) == 1:
+        act_to_y = {act_levels[0]: 0.5}
     else:
-        act_to_y = {a: i / (len(act_levels_present) - 1) for i, a in enumerate(act_levels_present)}
+        act_to_y = {a: i / (len(act_levels) - 1) for i, a in enumerate(act_levels)}
     dfp["activation_y"] = dfp["activation"].astype(str).map(act_to_y).astype(float)
 
-    # standardize categorical mapping (False->0, True->1)
+    enc_levels = sorted(dfp["diluent_encoding"].astype(str).str.lower().unique().tolist())
+    if len(enc_levels) == 1:
+        enc_to_y = {enc_levels[0]: 0.5}
+    else:
+        enc_to_y = {e: i / (len(enc_levels) - 1) for i, e in enumerate(enc_levels)}
+    dfp["diluent_encoding_y"] = dfp["diluent_encoding"].astype(str).str.lower().map(enc_to_y).astype(float)
+
     dfp["standardize_y"] = dfp["standardize_cont"].astype(bool).map({False: 0.0, True: 1.0}).astype(float)
 
     dims = [
+        ("diluent_encoding",  dfp["diluent_encoding_y"].astype(float).to_numpy(), "categorical_diluent_encoding"),
         ("hidden_size",       dfp["hidden_size"].astype(float).to_numpy(), "int_discrete"),
         ("n_hidden_layers",   dfp["n_hidden_layers"].astype(float).to_numpy(), "int_discrete"),
         ("activation",        dfp["activation_y"].astype(float).to_numpy(), "categorical_activation"),
@@ -521,7 +657,7 @@ def parallel_coordinates_plot(df_trials, out_png):
     idx_top = np.array([i for i in order_best if i in idx_plot_set][:min(TOP_N_THICK, len(idx_plot))], dtype=int)
     idx_rest = np.array([i for i in idx_plot if i not in set(idx_top.tolist())], dtype=int)
 
-    fig, ax = plt.subplots(figsize=(13.5, 6), dpi=200)
+    fig, ax = plt.subplots(figsize=(14.5, 6), dpi=200)
     ax.set_xlim(-0.5, D - 0.5)
     ax.set_ylim(-0.05, 1.05)
 
@@ -546,14 +682,17 @@ def parallel_coordinates_plot(df_trials, out_png):
         tick_x0, tick_x1 = j - 0.04, j + 0.04
 
         if kind == "categorical_activation":
-            levels = act_levels_present
-            if len(levels) == 1:
-                ys = [0.5]
-                labs = [levels[0]]
-            else:
-                ys = np.linspace(0.0, 1.0, len(levels))
-                labs = levels
-            for yv, lab in zip(ys, labs):
+            levels = act_levels
+            ys = [0.5] if len(levels) == 1 else np.linspace(0.0, 1.0, len(levels))
+            for yv, lab in zip(ys, levels):
+                ax.hlines(yv, tick_x0, tick_x1, color="k", linewidth=0.9, alpha=0.8)
+                ax.text(j, yv, str(lab), ha="center", va="center", fontsize=9,
+                        bbox=dict(facecolor="white", edgecolor="none", alpha=0.70, pad=0.35))
+
+        elif kind == "categorical_diluent_encoding":
+            levels = enc_levels
+            ys = [0.5] if len(levels) == 1 else np.linspace(0.0, 1.0, len(levels))
+            for yv, lab in zip(ys, levels):
                 ax.hlines(yv, tick_x0, tick_x1, color="k", linewidth=0.9, alpha=0.8)
                 ax.text(j, yv, str(lab), ha="center", va="center", fontsize=9,
                         bbox=dict(facecolor="white", edgecolor="none", alpha=0.70, pad=0.35))
@@ -599,8 +738,7 @@ def parallel_coordinates_plot(df_trials, out_png):
     for j, m in enumerate(meta):
         _draw_ticks_for_axis(j, m)
 
-    ax.set_title(f"Parallel coordinates (color = std CV RMSE; top {min(TOP_N_THICK, len(idx_plot))} thick by mean_rmse)")
-
+    ax.set_title("Parallel coordinates (color = std CV RMSE; thick = best by mean_rmse)")
     sm = mpl.cm.ScalarMappable(cmap=cmap, norm=norm_c)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax, pad=0.02)
@@ -611,14 +749,53 @@ def parallel_coordinates_plot(df_trials, out_png):
     plt.close(fig)
 
 
+def regenerate_plot_only():
+    if not os.path.exists(TRIALS_CSV):
+        raise FileNotFoundError(f"TRIALS_CSV not found: {TRIALS_CSV}")
+
+    df_trials = pd.read_csv(TRIALS_CSV)
+    if "standardize_cont" not in df_trials.columns:
+        df_trials["standardize_cont"] = True
+    if "loss_mode" not in df_trials.columns:
+        df_trials["loss_mode"] = "relative"
+    if "diluent_encoding" not in df_trials.columns:
+        df_trials["diluent_encoding"] = "onehot"
+
+    df_trials = df_trials.sort_values("mean_rmse").reset_index(drop=True)
+
+    print("\nCreating parallel coordinates plot...", flush=True)
+    parallel_coordinates_plot(df_trials, PC_PNG)
+    print(f"Saved plot: {PC_PNG}", flush=True)
+
+    print("\nTop 10 configs (by mean_rmse):", flush=True)
+    cols_show = [c for c in ["loss_mode","diluent_encoding","hidden_size","n_hidden_layers","activation","dropout",
+                             "standardize_cont","lr","mean_rmse","std_rmse","optimizer","use_scheduler","rel_eps"]
+                 if c in df_trials.columns]
+    print(df_trials.head(10)[cols_show].to_string(index=False), flush=True)
+
+
 # -------------------------
-# MAIN: full grid search with resume
+# MAIN: Bayesian HPO (Optuna) with resume
 # -------------------------
 def main():
+    if not bool(RUN_HPO):
+        regenerate_plot_only()
+        return
+
+    curve_mse_fn, metric_tag = get_curve_mse()
+    cont_cols, cat_cols, dil_enc_tag = get_feature_spec()
+    cont_dim = len(cont_cols)
+
     print("Loading and aggregating dataset...", flush=True)
     X_raw, Y, labels, batch_ids, t_eval = load_aggregated(CSV_PATH)
     print(f"  Loaded {len(batch_ids)} formulations; X dim={X_raw.shape[1]}, curve length T={Y.shape[1]}", flush=True)
+    print(f"  Diluent encoding: {dil_enc_tag} | cont_dim={cont_dim} | cat_dim={len(cat_cols)}", flush=True)
     print(f"  Time range: {t_eval.min()}..{t_eval.max()} minutes | solver=torchdiffeq({ODE_METHOD}) | n_fixed={N_FIXED:g}", flush=True)
+    if metric_tag == "REL":
+        print(f"  Metric: REL-RMSE with REL_EPS={REL_EPS:g} (stored in mean_rmse/std_rmse)", flush=True)
+    else:
+        print(f"  Metric: ABS-RMSE (stored in mean_rmse/std_rmse)", flush=True)
+    print(f"  Optimizer={OPTIMIZER_TYPE} | Scheduler={'on' if USE_SCHEDULER else 'off'} | LOSS_MODE={LOSS_MODE}", flush=True)
 
     # outer split
     train_idx, test_idx = stratified_train_test_split(labels, TEST_FRAC, SEED)
@@ -626,7 +803,7 @@ def main():
     print("Train counts by category:\n" + pd.Series(labels[train_idx]).value_counts().to_string(), flush=True)
     print("Test counts by category:\n"  + pd.Series(labels[test_idx]).value_counts().to_string(), flush=True)
 
-    # CV is done ONLY on the training set
+    # CV only on training set
     X_train_raw = X_raw[train_idx]
     Y_train = Y[train_idx]
     labels_train = labels[train_idx]
@@ -634,21 +811,24 @@ def main():
     splits = stratified_folds(labels_train, k=K_FOLDS, seed=SEED)
     print(f"Prepared {K_FOLDS}-fold CV splits on training set.", flush=True)
 
-    grid = list(itertools.product(
-        HIDDEN_SIZES, N_HIDDEN_LAYERS, ACTIVATIONS, DROPOUTS, STANDARDIZE_OPTIONS, LEARNING_RATES
-    ))
-    total_cfgs = len(grid)
-    print(f"Full grid size = {total_cfgs} configs (each config runs {K_FOLDS} folds).", flush=True)
-
-    # resume support
+    # resume support via TRIALS_CSV
     done_keys = set()
     if os.path.exists(TRIALS_CSV):
         prev = pd.read_csv(TRIALS_CSV)
         if "standardize_cont" not in prev.columns:
             prev["standardize_cont"] = True
             prev.to_csv(TRIALS_CSV, index=False)
+        if "loss_mode" not in prev.columns:
+            prev["loss_mode"] = "relative"
+            prev.to_csv(TRIALS_CSV, index=False)
+        if "diluent_encoding" not in prev.columns:
+            prev["diluent_encoding"] = "onehot"
+            prev.to_csv(TRIALS_CSV, index=False)
+
         for _, r in prev.iterrows():
             key = (
+                str(r.get("loss_mode", "relative")).strip().lower(),
+                str(r.get("diluent_encoding", "onehot")).strip().lower(),
                 int(r["hidden_size"]),
                 int(r["n_hidden_layers"]),
                 str(r["activation"]),
@@ -659,17 +839,48 @@ def main():
             done_keys.add(key)
         print(f"Resuming: found {len(done_keys)} completed configs in {TRIALS_CSV}", flush=True)
 
-    rows = []
-    cfg_counter = 0
+    def objective(trial: optuna.Trial) -> float:
+        hs = trial.suggest_int("hidden_size", HIDDEN_SIZE_MIN, HIDDEN_SIZE_MAX, step=HIDDEN_SIZE_STEP)
+        nl = trial.suggest_categorical("n_hidden_layers", N_HIDDEN_LAYERS)
+        act = trial.suggest_categorical("activation", ACTIVATIONS)
+        drop = trial.suggest_categorical("dropout", DROPOUTS)
+        stdz = trial.suggest_categorical("standardize_cont", STANDARDIZE_OPTIONS)
+        lr = trial.suggest_float("lr", LR_MIN, LR_MAX, log=True)
 
-    for (hs, nl, act, drop, stdz, lr) in grid:
-        key = (hs, nl, act, float(drop), bool(stdz), float(lr))
-        if key in done_keys:
-            continue
+        loss_mode_key = str(LOSS_MODE).strip().lower()
+        dil_key = dil_enc_tag
+        key = (loss_mode_key, dil_key, int(hs), int(nl), str(act), float(drop), bool(stdz), float(lr))
 
-        cfg_counter += 1
-        config_id = f"{hs}-{nl}-{act}-drop{drop:g}-std{int(bool(stdz))}-lr{lr:g}"
-        print(f"\n[CONFIG {cfg_counter}] {config_id}", flush=True)
+        # If already in CSV, reuse its score (keeps resume stable)
+        if key in done_keys and os.path.exists(TRIALS_CSV):
+            df_prev = pd.read_csv(TRIALS_CSV)
+            if "loss_mode" not in df_prev.columns:
+                df_prev["loss_mode"] = "relative"
+            if "diluent_encoding" not in df_prev.columns:
+                df_prev["diluent_encoding"] = "onehot"
+
+            m = (
+                (df_prev["loss_mode"].astype(str).str.lower() == loss_mode_key) &
+                (df_prev["diluent_encoding"].astype(str).str.lower() == dil_key) &
+                (df_prev["hidden_size"].astype(int) == int(hs)) &
+                (df_prev["n_hidden_layers"].astype(int) == int(nl)) &
+                (df_prev["activation"].astype(str) == str(act)) &
+                (df_prev["dropout"].astype(float) == float(drop)) &
+                (df_prev["standardize_cont"].astype(bool) == bool(stdz))
+            )
+            lr_prev = df_prev.loc[m, "lr"].astype(float).to_numpy()
+            if lr_prev.size > 0:
+                j = int(np.argmin(np.abs(lr_prev - float(lr))))
+                if abs(lr_prev[j] - float(lr)) < 1e-12:
+                    mean_rmse = float(df_prev.loc[df_prev.index[m][j], "mean_rmse"])
+                    return mean_rmse
+
+        config_id = f"trial{trial.number}"
+        print(
+            f"\n[TRIAL {trial.number}] mode={LOSS_MODE} diluent={dil_key} hs={hs} nl={nl} act={act} drop={drop:g} std={int(bool(stdz))} "
+            f"lr={lr:.3g} | opt={OPTIMIZER_TYPE} sched={'on' if USE_SCHEDULER else 'off'}",
+            flush=True
+        )
 
         hp = {
             "hidden_size": int(hs),
@@ -680,21 +891,28 @@ def main():
             "lr": float(lr),
         }
 
-        fold_rmses = []
-        cfg_t0 = time.time()
+        fold_scores = []
+        t0 = time.time()
         for fold_id, (tr, va) in enumerate(splits, 1):
             print(f"  -> fold {fold_id}/{K_FOLDS} start...", flush=True)
             fold_t0 = time.time()
             verbose_epochs = (fold_id == 1)
-            r = train_one_fold(X_train_raw, Y_train, t_eval, tr, va, hp, fold_id, config_id, verbose_epochs=verbose_epochs)
-            fold_rmses.append(r)
-            print(f"  <- fold {fold_id}/{K_FOLDS} done | rmse={r:.5f} | fold_elapsed={time.time()-fold_t0:.1f}s", flush=True)
+            r = train_one_fold(X_train_raw, Y_train, t_eval, tr, va, hp, fold_id, config_id, cont_dim=cont_dim, verbose_epochs=verbose_epochs)
+            fold_scores.append(r)
+            print(f"  <- fold {fold_id}/{K_FOLDS} done | {metric_tag}_rmse={r:.5f} | fold_elapsed={time.time()-fold_t0:.1f}s", flush=True)
 
-        mean_rmse = float(np.mean(fold_rmses))
-        std_rmse  = float(np.std(fold_rmses))
-        print(f"[CONFIG DONE] {config_id} | mean_rmse={mean_rmse:.5f} ± {std_rmse:.5f} | cfg_elapsed={time.time()-cfg_t0:.1f}s", flush=True)
+            if USE_PRUNER:
+                trial.report(float(np.mean(fold_scores)), step=fold_id)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
 
-        rows.append({
+        mean_rmse = float(np.mean(fold_scores))
+        std_rmse  = float(np.std(fold_scores))
+        print(f"[TRIAL DONE] {config_id} | mean_{metric_tag}_rmse={mean_rmse:.5f} ± {std_rmse:.5f} | trial_elapsed={time.time()-t0:.1f}s", flush=True)
+
+        row = {
+            "loss_mode": loss_mode_key,
+            "diluent_encoding": dil_key,
             "hidden_size": int(hs),
             "n_hidden_layers": int(nl),
             "activation": str(act),
@@ -703,35 +921,50 @@ def main():
             "lr": float(lr),
             "mean_rmse": mean_rmse,
             "std_rmse": std_rmse,
-        })
+            "optimizer": str(OPTIMIZER_TYPE).strip().lower(),
+            "use_scheduler": bool(USE_SCHEDULER),
+            "rel_eps": float(REL_EPS) if loss_mode_key == "relative" else np.nan,
+        }
 
-        # checkpoint append/update CSV
-        out_df = pd.DataFrame(rows)
+        out_df = pd.DataFrame([row])
         if os.path.exists(TRIALS_CSV):
             prev = pd.read_csv(TRIALS_CSV)
             if "standardize_cont" not in prev.columns:
                 prev["standardize_cont"] = True
+            if "loss_mode" not in prev.columns:
+                prev["loss_mode"] = "relative"
+            if "diluent_encoding" not in prev.columns:
+                prev["diluent_encoding"] = "onehot"
             out_df = pd.concat([prev, out_df], ignore_index=True)
 
         out_df = out_df.drop_duplicates(
-            subset=["hidden_size", "n_hidden_layers", "activation", "dropout", "standardize_cont", "lr"]
+            subset=["loss_mode","diluent_encoding","hidden_size","n_hidden_layers","activation","dropout","standardize_cont","lr"]
         )
         out_df.to_csv(TRIALS_CSV, index=False)
-        rows = []
-        print(f"Checkpoint saved to {TRIALS_CSV}", flush=True)
 
-    # final plot
-    if os.path.exists(TRIALS_CSV):
-        df_trials = pd.read_csv(TRIALS_CSV).sort_values("mean_rmse").reset_index(drop=True)
-        if "standardize_cont" not in df_trials.columns:
-            df_trials["standardize_cont"] = True
-        print("\nCreating parallel coordinates plot...", flush=True)
-        parallel_coordinates_plot(df_trials, PC_PNG)
-        print(f"Saved plot: {PC_PNG}", flush=True)
-        print("\nTop 10 configs:", flush=True)
-        print(df_trials.head(10).to_string(index=False), flush=True)
-    else:
-        print("No results CSV found; nothing to plot.", flush=True)
+        done_keys.add(key)
+        return mean_rmse
+
+    sampler = TPESampler(seed=SEED)
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=2) if USE_PRUNER else optuna.pruners.NopPruner()
+
+    study = optuna.create_study(
+        study_name=OPTUNA_STUDY_NAME,
+        direction="minimize",
+        sampler=sampler,
+        pruner=pruner,
+        storage=OPTUNA_STORAGE,
+        load_if_exists=True,
+    )
+
+    print(f"\nRunning Optuna optimization: n_trials={N_TRIALS} | storage={OPTUNA_STORAGE} | study={OPTUNA_STUDY_NAME}", flush=True)
+    study.optimize(objective, n_trials=N_TRIALS)
+
+    print("\nOptuna done.", flush=True)
+    print(f"Best mean_rmse = {study.best_value:.6f}", flush=True)
+    print(f"Best params    = {study.best_params}", flush=True)
+
+    regenerate_plot_only()
 
 
 if __name__ == "__main__":

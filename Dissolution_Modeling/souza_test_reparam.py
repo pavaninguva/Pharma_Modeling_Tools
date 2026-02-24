@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """
-Train the *best* hyperparameter configuration (from a grid-search results CSV)
+Train the *best* hyperparameter configuration (from a grid-search/Optuna results CSV)
 on the full training set, then evaluate on the held-out test set.
 
 Outputs:
 1) Parity plot: test data vs model predictions (all test points across all curves)
-2) Dynamics plots: continuous predicted curves overlaid with test data points,
-   split across subplots with <= 5 curves per subplot.
+2) Dynamics plots: continuous predicted curves overlaid with test data points
+3) Saves model checkpoint
 
 Assumptions:
-- You already ran the grid search script and produced TRIALS_CSV with columns:
+- TRIALS_CSV has columns:
   hidden_size, n_hidden_layers, activation, dropout, standardize_cont, lr, mean_rmse, std_rmse
-- Your dataset CSV has the cleaned columns used previously.
+  NOTE: if TRIALS_CSV was produced by your *relative* crossval run, mean_rmse/std_rmse are REL-RMSEs.
 
+Alignment updates:
+- Can train with RELATIVE squared error (REL-MSE) OR ABSOLUTE squared error (ABS-MSE).
+- Can switch Adam / AdamW.
+- Can switch ReduceLROnPlateau on/off (stepped on train loss since no val split).
+- Optionally reads optimizer/scheduler/loss_mode from TRIALS_CSV if those columns exist.
+- Adds odeint failure handling similar to your crossval script.
 """
 
 import os, re, math, time
@@ -30,7 +36,6 @@ mpl.rcParams.update({
     "text.usetex": True,
     "font.family": "serif",
 })
-
 
 # -------------------------
 # CONFIG
@@ -53,10 +58,32 @@ N_FIXED = 1.0
 
 # training settings for the final fit
 MAX_EPOCHS = 700
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 WEIGHT_DECAY = 1e-6
 GRAD_CLIP = 5.0
 LOG_EVERY = 25
+
+# Optimizer / scheduler / loss switches
+# If TRIALS_CSV contains these columns, they can override defaults:
+#   optimizer: "adam" or "adamw"
+#   use_scheduler: bool
+#   loss_mode: "relative" or "absolute"
+OPTIMIZER_DEFAULT = "adam"      # "adamw" or "adam"
+USE_SCHEDULER_DEFAULT = True    # ReduceLROnPlateau
+LOSS_MODE_DEFAULT = "absolute"  # "relative" or "absolute"
+
+SCHED_FACTOR = 0.9
+SCHED_PATIENCE = 50
+SCHED_MIN_LR = 1e-6
+SCHED_COOLDOWN = 0
+
+# Relative error settings
+REL_EPS = 1e-3
+
+# Warm-start settings
+WARM_START = False
+WARM_START_CKPT = "./best_model_eval_outputs/best_paramnet_checkpoint.pt"  # or wherever
+WARM_START_STRICT = True  # strict=True requires exact architecture match
 
 # plot outputs
 OUT_DIR = "./best_model_eval_outputs"
@@ -168,6 +195,30 @@ def standardize_cont_global(X, cont_dim, train_idx):
 # -------------------------
 # Load best hyperparameters from trials CSV
 # -------------------------
+def _as_bool(x, default=False):
+    if x is None:
+        return default
+    if isinstance(x, (bool, np.bool_)):
+        return bool(x)
+    s = str(x).strip().lower()
+    if s in ("1", "true", "t", "yes", "y"):
+        return True
+    if s in ("0", "false", "f", "no", "n"):
+        return False
+    return default
+
+
+def _as_loss_mode(x, default="relative"):
+    if x is None:
+        return str(default).lower()
+    s = str(x).strip().lower()
+    if s in ("rel", "relative", "rel_mse", "rel-mse"):
+        return "relative"
+    if s in ("abs", "absolute", "abs_mse", "abs-mse"):
+        return "absolute"
+    return str(default).lower()
+
+
 def load_best_config(trials_csv: str):
     df = pd.read_csv(trials_csv)
 
@@ -183,6 +234,10 @@ def load_best_config(trials_csv: str):
     df = df.sort_values("mean_rmse", ascending=True).reset_index(drop=True)
     best = df.iloc[0]
 
+    optimizer = str(best["optimizer"]).lower() if "optimizer" in df.columns else OPTIMIZER_DEFAULT
+    use_scheduler = _as_bool(best["use_scheduler"], default=USE_SCHEDULER_DEFAULT) if "use_scheduler" in df.columns else USE_SCHEDULER_DEFAULT
+    loss_mode = _as_loss_mode(best["loss_mode"], default=LOSS_MODE_DEFAULT) if "loss_mode" in df.columns else LOSS_MODE_DEFAULT
+
     hp = {
         "hidden_size": int(best["hidden_size"]),
         "n_hidden_layers": int(best["n_hidden_layers"]),
@@ -190,6 +245,9 @@ def load_best_config(trials_csv: str):
         "dropout": float(best["dropout"]),
         "standardize_cont": bool(best["standardize_cont"]),
         "lr": float(best["lr"]),
+        "optimizer": optimizer,                 # "adam" or "adamw"
+        "use_scheduler": bool(use_scheduler),   # ReduceLROnPlateau on/off
+        "loss_mode": str(loss_mode).lower(),    # "relative" or "absolute"
     }
     return hp, best
 
@@ -214,6 +272,8 @@ class ParamNet(nn.Module):
             act = nn.LeakyReLU
         elif activation == "gelu":
             act = nn.GELU
+        elif activation == "mish":
+            act = nn.Mish
         else:
             raise ValueError(f"Unknown activation='{activation}'.")
 
@@ -280,19 +340,108 @@ def odeint_solve_batch(lam, tau, beta, t_eval, device,
     return torch.clamp(y, 0.0, 1.0)
 
 
-def curve_mse(pred, target):
+# -------------------------
+# Loss/metrics
+# -------------------------
+def abs_mse(pred, target):
+    """
+    Absolute MSE pooled over (batch,time).
+    """
+    target = target.to(dtype=pred.dtype)
     return ((pred - target) ** 2).mean()
 
 
-def curve_rmse(pred, target):
-    return torch.sqrt(((pred - target) ** 2).mean())
+def rel_mse(pred, target, rel_eps=REL_EPS):
+    """
+    Relative MSE pooled over (batch,time):
+        rel_err = (pred - y) / max(y, rel_eps)
+        mse = mean(rel_err^2)
+    """
+    target = target.to(dtype=pred.dtype)
+    denom = torch.clamp(target, min=float(rel_eps))
+    rel_err = (pred - target) / denom
+    return (rel_err ** 2).mean()
+
+
+def choose_mse(loss_mode: str):
+    """
+    Returns a callable loss(pred, target) -> scalar tensor
+    """
+    m = str(loss_mode).strip().lower()
+    if m == "relative":
+        return lambda pred, target: rel_mse(pred, target, rel_eps=REL_EPS)
+    if m == "absolute":
+        return lambda pred, target: abs_mse(pred, target)
+    raise ValueError("loss_mode must be 'relative' or 'absolute'.")
+
+
+def rel_rmse(pred, target, rel_eps=REL_EPS):
+    return torch.sqrt(rel_mse(pred, target, rel_eps=rel_eps))
+
+
+def abs_rmse(pred, target):
+    return torch.sqrt(abs_mse(pred, target))
+
+
+# -------------------------
+# Optimizer factory
+# -------------------------
+
+def warm_start_model_if_possible(model, hp, ckpt_path, device):
+    if (ckpt_path is None) or (not os.path.exists(ckpt_path)):
+        print(f"[warmstart] No checkpoint found at {ckpt_path}; training from scratch.", flush=True)
+        return False
+
+    # SECURITY NOTE: only torch.load checkpoints you trust (pickle-based).
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    # Optional sanity checks
+    if "in_dim" in ckpt and int(ckpt["in_dim"]) != next(model.parameters()).shape[1]:
+        print(f"[warmstart] Warning: ckpt in_dim={ckpt['in_dim']} vs current in_dim={next(model.parameters()).shape[1]}", flush=True)
+
+    if "hp" in ckpt:
+        old_hp = ckpt["hp"]
+        keys_to_check = ["hidden_size", "n_hidden_layers", "activation", "dropout"]
+        mismatch = {k: (old_hp.get(k), hp.get(k)) for k in keys_to_check if old_hp.get(k) != hp.get(k)}
+        if mismatch:
+            print(f"[warmstart] Warning: HP mismatch vs checkpoint: {mismatch}", flush=True)
+
+    model.load_state_dict(ckpt["model_state_dict"], strict=bool(WARM_START_STRICT))
+    print(f"[warmstart] Loaded model weights from {ckpt_path}", flush=True)
+    return True
+
+
+def make_optimizer(params, optimizer_name: str, lr: float, weight_decay: float):
+    name = str(optimizer_name).strip().lower()
+    if name == "adamw":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    elif name == "adam":
+        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Unknown optimizer '{optimizer_name}'. Use 'adam' or 'adamw'.")
 
 
 # -------------------------
 # Train on full training set (no CV here)
 # -------------------------
-def train_full(model, Xtr, Ytr, t_eval, lr, verbose=True):
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+def train_full(model, Xtr, Ytr, t_eval, lr, optimizer_name, use_scheduler, loss_mode, verbose=True):
+    opt = make_optimizer(model.parameters(), optimizer_name=optimizer_name, lr=lr, weight_decay=WEIGHT_DECAY)
+
+    loss_fn = choose_mse(loss_mode)
+
+    scheduler = None
+    if bool(use_scheduler):
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt,
+            mode="min",
+            factor=SCHED_FACTOR,
+            patience=SCHED_PATIENCE,
+            threshold=1e-6,
+            threshold_mode="rel",
+            cooldown=SCHED_COOLDOWN,
+            min_lr=SCHED_MIN_LR,
+            verbose=False,
+        )
 
     n_train = Xtr.shape[0]
     t0 = time.time()
@@ -311,9 +460,15 @@ def train_full(model, Xtr, Ytr, t_eval, lr, verbose=True):
             xb, yb = Xtr[idx], Ytr[idx]
 
             lam, tau, beta = model(xb)
-            pred = odeint_solve_batch(lam, tau, beta, t_eval, DEVICE)
 
-            loss = curve_mse(pred, yb)
+            try:
+                pred = odeint_solve_batch(lam, tau, beta, t_eval, DEVICE)
+                loss = loss_fn(pred, yb)
+            except Exception:
+                # keep graph connected so backward works
+                loss = torch.tensor(1e3, device=DEVICE, dtype=torch.float32) + 0.0 * (
+                    lam.mean() + tau.mean() + beta.mean()
+                )
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -325,12 +480,23 @@ def train_full(model, Xtr, Ytr, t_eval, lr, verbose=True):
 
         epoch_loss /= max(1, n_batches)
 
+        if scheduler is not None:
+            scheduler.step(epoch_loss)
+
+        cur_lr = float(opt.param_groups[0]["lr"])
+
         if epoch_loss < best_loss - 1e-12:
             best_loss = epoch_loss
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
         if verbose and (epoch == 1 or epoch % LOG_EVERY == 0):
-            print(f"epoch={epoch:04d} train_mse={epoch_loss:.6f} best_mse={best_loss:.6f} elapsed={time.time()-t0:.1f}s", flush=True)
+            tag = "rel_mse" if str(loss_mode).lower() == "relative" else "abs_mse"
+            print(
+                f"epoch={epoch:04d} train_{tag}={epoch_loss:.6f} best_{tag}={best_loss:.6f} "
+                f"lr={cur_lr:.3g} opt={optimizer_name} sched={int(bool(use_scheduler))} "
+                f"elapsed={time.time()-t0:.1f}s",
+                flush=True
+            )
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -352,10 +518,7 @@ def predict_dataset(model, X, t_eval):
 # -------------------------
 # Plots
 # -------------------------
-def make_parity_plot(y_true, y_pred, out_png):
-    """
-    Parity over *all test points* (flattened across batches and time).
-    """
+def make_parity_plot(y_true, y_pred, out_png, text_note=None):
     yt = y_true.reshape(-1)
     yp = y_pred.reshape(-1)
 
@@ -366,27 +529,26 @@ def make_parity_plot(y_true, y_pred, out_png):
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel(r"$f$ (Test)")
     ax.set_ylabel(r"$f$ (Predicted)")
-    # ax.set_title("Parity plot (test set)")
+
+    if text_note is not None:
+        ax.text(
+            0.03, 0.97, text_note,
+            transform=ax.transAxes, ha="left", va="top",
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.75, pad=4.0),
+            fontsize=10,
+        )
+
     fig.tight_layout()
-    fig.savefig(out_png, bbox_inches="tight",dpi=300)
+    fig.savefig(out_png, bbox_inches="tight", dpi=300)
     plt.close(fig)
 
 
 def make_dynamics_plot(test_batch_ids, t_eval, y_true, model, X_test, out_png, curves_per_subplot=5):
-    """
-    For each test formulation:
-    - integrate on a dense time grid for a smooth continuous curve
-    - overlay the observed test points
-    - split across subplots with <= curves_per_subplot curves each
-    """
     t_dense = np.linspace(float(np.min(t_eval)), float(np.max(t_eval)), 250).astype(np.float32)
 
     n = len(test_batch_ids)
-    # We will always create a 2x2 grid (4 panels).
     n_panels = 4
 
-    # Keep your original intent of <= curves_per_subplot per panel,
-    # but if there are too many curves, auto-increase per panel so everything fits.
     n_per = int(curves_per_subplot)
     if n > n_panels * n_per:
         n_per = int(math.ceil(n / n_panels))
@@ -402,38 +564,30 @@ def make_dynamics_plot(test_batch_ids, t_eval, y_true, model, X_test, out_png, c
         end = min(n, (pi + 1) * n_per)
 
         if start >= n:
-            # Hide unused panels
             ax.set_visible(False)
             continue
 
         for j in range(start, end):
             bid = test_batch_ids[j]
-            # Keep only the short BatchID token, e.g., "F63"
             short_bid = str(bid).split()[0]
-
             xj = X_test[j:j+1]  # [1, D]
 
             with torch.no_grad():
                 lam, tau, beta = model(xj)
                 pred_dense = odeint_solve_batch(lam, tau, beta, t_dense, DEVICE).cpu().numpy().reshape(-1)
 
-            # One legend entry per batch: label on the line only
             ax.plot(t_dense, pred_dense, linewidth=2.0, label=short_bid)
-            # No legend entry for data points
             ax.scatter(t_eval, y_true[j], s=16, alpha=0.85, label="_nolegend_")
 
         ax.set_ylabel(r"Release Fraction ($f$)")
-        # No gridlines (removed)
         ax.legend(ncol=2, fontsize=8, frameon=False)
 
-    # Shared x label on bottom row only is implicit, but we can set last row:
     for ax in axes[2:]:
         if ax.get_visible():
             ax.set_xlabel(r"Time (min)")
 
-    # fig.suptitle(r"Test Dynamics: Data Points + Continuous Predicted Curves", y=0.995)
     fig.tight_layout()
-    fig.savefig(out_png, bbox_inches="tight",dpi=300)
+    fig.savefig(out_png, bbox_inches="tight", dpi=300)
     plt.close(fig)
 
 
@@ -452,11 +606,10 @@ def main():
     print("Best config:", hp, flush=True)
     print("Best row summary:", best_row.to_dict(), flush=True)
 
-    # outer split (same as before)
     train_idx, test_idx = stratified_train_test_split(labels, TEST_FRAC, SEED)
     print(f"Split: train={len(train_idx)} test={len(test_idx)}", flush=True)
 
-    # global train-set stats standardization (if enabled by best config)
+    mu, sd = None, None
     if bool(hp["standardize_cont"]):
         print("Applying standardization using TRAIN statistics only...", flush=True)
         X_all, mu, sd = standardize_cont_global(X_raw, cont_dim=len(CONT_COLS), train_idx=train_idx)
@@ -464,13 +617,11 @@ def main():
         print("Standardization disabled for best config.", flush=True)
         X_all = X_raw
 
-    # tensors
     Xtr = torch.tensor(X_all[train_idx], device=DEVICE)
     Ytr = torch.tensor(Y[train_idx], device=DEVICE)
     Xte = torch.tensor(X_all[test_idx], device=DEVICE)
     Yte = torch.tensor(Y[test_idx], device=DEVICE)
 
-    # build + train model
     model = ParamNet(
         in_dim=Xtr.shape[1],
         hidden_size=hp["hidden_size"],
@@ -479,8 +630,23 @@ def main():
         dropout=hp["dropout"],
     ).to(DEVICE)
 
-    print("Training best model on FULL training set...", flush=True)
-    train_full(model, Xtr, Ytr, t_eval, lr=hp["lr"], verbose=True)
+    if WARM_START:
+        warm_start_model_if_possible(model, hp, WARM_START_CKPT, DEVICE)
+
+    print(
+        "Training best model on FULL training set...\n"
+        f"  loss_mode={hp['loss_mode']}  optimizer={hp['optimizer']}  use_scheduler={int(bool(hp['use_scheduler']))}  REL_EPS={REL_EPS:g}",
+        flush=True
+    )
+
+    train_full(
+        model, Xtr, Ytr, t_eval,
+        lr=hp["lr"],
+        optimizer_name=hp["optimizer"],
+        use_scheduler=hp["use_scheduler"],
+        loss_mode=hp["loss_mode"],
+        verbose=True
+    )
 
     ckpt = {
         "model_state_dict": model.state_dict(),
@@ -497,21 +663,34 @@ def main():
         "ODE_RTOL": float(ODE_RTOL),
         "ODE_ATOL": float(ODE_ATOL),
         "seed": int(SEED),
+        "REL_EPS": float(REL_EPS),
+        "optimizer_used": str(hp["optimizer"]),
+        "use_scheduler": bool(hp["use_scheduler"]),
+        "loss_mode": str(hp["loss_mode"]),
+        "scheduler": {
+            "name": "ReduceLROnPlateau",
+            "factor": float(SCHED_FACTOR),
+            "patience": int(SCHED_PATIENCE),
+            "min_lr": float(SCHED_MIN_LR),
+            "cooldown": int(SCHED_COOLDOWN),
+        } if bool(hp["use_scheduler"]) else None,
     }
     torch.save(ckpt, MODEL_CKPT)
     print(f"Saved trained model checkpoint -> {MODEL_CKPT}", flush=True)
 
-    # test predictions
     print("Predicting on test set...", flush=True)
     with torch.no_grad():
         Ypred = predict_dataset(model, Xte, t_eval)
 
-    test_rmse = float(curve_rmse(Ypred, Yte).item())
-    print(f"Test RMSE (all points pooled) = {test_rmse:.6f}", flush=True)
+    # Always report both (helps interpret even if you trained on one)
+    test_rel_rmse = float(rel_rmse(Ypred, Yte, rel_eps=REL_EPS).item())
+    test_abs_rmse = float(abs_rmse(Ypred, Yte).item())
+    print(f"Test REL-RMSE (pooled points) = {test_rel_rmse:.6f}   (REL_EPS={REL_EPS:g})", flush=True)
+    print(f"Test ABS-RMSE (pooled points) = {test_abs_rmse:.6f}", flush=True)
 
-    # plots
     print(f"Saving parity plot -> {PARITY_FIG}", flush=True)
-    make_parity_plot(Yte.cpu().numpy(), Ypred.cpu().numpy(), PARITY_FIG)
+    note = rf"trained={hp['loss_mode']}\quad REL-RMSE={test_rel_rmse:.4f}\quad ABS-RMSE={test_abs_rmse:.4f}"
+    make_parity_plot(Yte.cpu().numpy(), Ypred.cpu().numpy(), PARITY_FIG, text_note=note)
 
     print(f"Saving dynamics plot -> {DYNAMICS_FIG}", flush=True)
     test_batch_ids = batch_ids[test_idx]

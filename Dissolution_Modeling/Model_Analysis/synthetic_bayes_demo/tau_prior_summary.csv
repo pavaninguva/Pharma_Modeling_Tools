@@ -1,0 +1,4 @@
+Case,tau_prior_kind,tau0_repr,tau_lo,tau_hi,t_star_repr,dfdt_max,prior_mode,t1_first_pos_time,tstar_lo,tstar_hi,flat_ratio,smooth_lambda,tau_prior_factor,tau_prior_logsig,force_early_uniform,flat_switch_to_early_uniform,flat_ratio_threshold
+Zero,lognormal,0.7801950487621905,,,0.7801950487621905,0.021709194904995056,spline_peak,15.0,,,2.493089952155625,5.0,1.0,0.5,False,True,1.1
+First,lognormal,0.8402100525131283,,,0.8402100525131283,0.015907650375179563,spline_peak,15.0,,,9.979691325432697,5.0,1.0,0.5,False,True,1.1
+Sigmoid,lognormal,51.40285071267817,,,51.40285071267817,0.00751371188605081,spline_peak,15.0,,,1.6653867451902804,5.0,1.0,0.5,False,True,1.1
