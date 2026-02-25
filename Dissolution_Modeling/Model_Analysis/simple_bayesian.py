@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
 """
-synthetic_bayesian.py (cleaned)
+synthetic_bayesian_uniform_tau.py  (cleaned + updated)
 
-Synthetic data + Bayesian parameter inference (emcee) for the n=1 closed-form model:
+Requested changes:
+1) Fit-with-bands plot:
+   - Put the CASE label (Zero/First/Sigmoid) + parameter values in the SUBPLOT TITLE
+   - (No extra textbox annotation)
 
-    df/dt = lam * (t/(tau+t)) * (1-f)^beta,   f(0)=0
+2) Corner plot montage (1 row):
+   - Each subplot in the montage has a title with the CASE label
 
-Sampling is done in log-space:
-    z = [log lam, log tau, log beta]
+Notes:
+- Individual corner plots themselves are kept clean (no suptitle; show_titles=False).
+- Montage adds titles above each image panel.
+- Uniform priors in NATURAL space for (lambda, tau, beta) within bounds.
+  Sampling in z = log(theta) => log-prior = z0+z1+z2 inside bounds.
 
-Priors:
-  - lam ~ Uniform(LAM_BOUNDS) in natural space  -> log-prior adds +z0 within bounds
-  - beta ~ Uniform(BETA_BOUNDS) in natural space -> log-prior adds +z2 within bounds
-  - tau prior:
-        log(tau) ~ Normal(mu_tau, sig_tau^2), truncated to TAU_BOUNDS
-    where (mu_tau, sig_tau) are computed from the curve using tau_prior_tools.
-    If tau-prior estimation fails, fall back to uniform(tau) in TAU_BOUNDS (adds +z1).
-
-Outputs (in OUT_DIR):
+Outputs (OUT_DIR):
   synthetic_data.csv
-  tau_prior_summary.csv
   posterior_samples_<case>.csv
   corner_<case>.png
-  corner_montage.png
+  corner_montage_row.png
   fit_with_bands.png
 
 Requires:
   pip install emcee corner numpy pandas matplotlib scipy
-  (optional for QP monotone smoothing in tau_prior_tools)
-  pip install cvxpy osqp   (or scs)
 """
 
 import os
@@ -39,13 +35,11 @@ import matplotlib.image as mpimg
 
 from scipy.optimize import least_squares
 
-from tau_prior_tools import compute_tau_lognormal_prior
-
 
 # ============================================================
 # USER SETTINGS
 # ============================================================
-OUT_DIR = "synthetic_bayes_demo"
+OUT_DIR = "synthetic_bayes_demo_uniform_tau"
 
 # ---- Synthetic sampling grid ----
 T_END_MIN = 240.0
@@ -67,25 +61,6 @@ SEED = 42
 LAM_BOUNDS  = (1e-6, 1e2)
 TAU_BOUNDS  = (1e-6, 1e4)
 BETA_BOUNDS = (1e-4, 1e2)
-
-# ---- Tau prior (lognormal) estimation knobs ----
-USE_TAU_PRIOR = True
-TAU_PRIOR_FACTOR = 1.0
-
-TAU_EST_SMOOTH_LAMBDA = 5.0
-TAU_EST_DENSE = 4000
-TAU_EST_PEAK_FRAC = 0.99
-TAU_EST_EXCLUDE_BOUNDARIES = False
-TAU_EST_BOUNDARY_EPS_FRAC = 1e-4
-TAU_EST_BOUNDARY_EPS_ABS  = 1e-12
-
-# flat derivative => use early representative t* and inflate logsig
-TAU_EST_FLAT_RATIO_THRESHOLD = 1.10
-TAU_PRIOR_LOGSIG = 0.50        # normal case
-TAU_PRIOR_LOGSIG_FLAT = 1.00   # flat case: broader prior
-
-EARLY_EPS_ABS  = 1e-12
-EARLY_EPS_FRAC = 1e-6
 
 # ---- MCMC ----
 N_WALKERS = 48
@@ -113,7 +88,7 @@ DPI = 180
 
 
 # ============================================================
-# True cases
+# True cases (order matters for montage + plots)
 # ============================================================
 TRUE_CASES = {
     "Zero":    dict(lam=0.025, tau=1.0,  beta=0.02),
@@ -135,7 +110,7 @@ if USE_TEX:
 
 
 # ============================================================
-# Closed-form solution (n=1)
+# Model (closed-form, n=1)
 # df/dt = lam * (t/(tau+t)) * (1-f)^beta, f(0)=0
 # I(t)=∫0^t s/(tau+s) ds = t - tau*log(1+t/tau)
 # ============================================================
@@ -215,29 +190,14 @@ def unpack(z):
 
 
 # ============================================================
-# Priors
+# Prior: Uniform in natural space for ALL params
 # ============================================================
-def log_prior(z, *, mu_tau=None, sig_tau=None):
-    """
-    z = [log lam, log tau, log beta]
-
-    lam, beta: Uniform in natural space => in log-space: +z0 + z2 within bounds.
-    tau:
-      - if (mu_tau, sig_tau) provided: log(tau) ~ Normal(mu_tau, sig_tau^2)
-      - else: Uniform(tau) in natural space => +z1 within bounds
-    """
+def log_prior(z):
     lb, ub = bounds_log()
     if np.any(z < lb) or np.any(z > ub):
         return -np.inf
-
-    lp = float(z[0] + z[2])  # Jacobians for uniform(lam), uniform(beta)
-
-    if (mu_tau is not None) and (sig_tau is not None) and np.isfinite(mu_tau) and np.isfinite(sig_tau) and sig_tau > 0:
-        lp += float(-0.5 * ((z[1] - float(mu_tau)) / float(sig_tau)) ** 2)  # constants dropped
-    else:
-        lp += float(z[1])  # uniform(tau) Jacobian fallback
-
-    return lp
+    # Jacobian for theta = exp(z): p(z) ∝ exp(z0+z1+z2)
+    return float(np.sum(z))
 
 
 # ============================================================
@@ -251,8 +211,8 @@ def log_likelihood(z, t, y):
     return float(-0.5 * np.sum(r * r + 2.0 * np.log(sig) + np.log(2.0 * np.pi)))
 
 
-def log_posterior(z, t, y, mu_tau, sig_tau):
-    lp = log_prior(z, mu_tau=mu_tau, sig_tau=sig_tau)
+def log_posterior(z, t, y):
+    lp = log_prior(z)
     if not np.isfinite(lp):
         return -np.inf
     ll = log_likelihood(z, t, y)
@@ -292,7 +252,7 @@ def fit_mle_log(t, y, rng):
 # ============================================================
 # MCMC
 # ============================================================
-def run_mcmc(t, y, rng, *, case_name, mu_tau, sig_tau):
+def run_mcmc(t, y, rng):
     import emcee
 
     lb, ub = bounds_log()
@@ -308,7 +268,7 @@ def run_mcmc(t, y, rng, *, case_name, mu_tau, sig_tau):
     sampler = emcee.EnsembleSampler(
         N_WALKERS, ndim,
         log_posterior,
-        args=(t, y, mu_tau, sig_tau),
+        args=(t, y),
     )
 
     state = sampler.run_mcmc(p0, N_BURN, progress=True)
@@ -317,21 +277,40 @@ def run_mcmc(t, y, rng, *, case_name, mu_tau, sig_tau):
 
     chain = sampler.get_chain(flat=True, thin=THIN)
     acc = float(np.mean(sampler.acceptance_fraction))
+    return chain, acc
 
+
+# ============================================================
+# Summaries + formatting
+# ============================================================
+def chain_to_df(chain, case_name, acc):
     theta = np.exp(chain)
     df = pd.DataFrame(theta, columns=["lambda", "tau", "beta"])
     df["log_lambda"] = chain[:, 0]
     df["log_tau"]    = chain[:, 1]
     df["log_beta"]   = chain[:, 2]
     df["Case"]       = str(case_name)
-    df["accept_frac"] = acc
-    return df, acc
+    df["accept_frac"] = float(acc)
+    return df
+
+
+def posterior_medians(samples_df):
+    lam_hat = float(np.median(samples_df["lambda"].to_numpy(float)))
+    tau_hat = float(np.median(samples_df["tau"].to_numpy(float)))
+    beta_hat = float(np.median(samples_df["beta"].to_numpy(float)))
+    return lam_hat, tau_hat, beta_hat
+
+
+def fmt_g(x):
+    if not np.isfinite(x):
+        return "nan"
+    return f"{x:.3g}"
 
 
 # ============================================================
 # Plot helpers
 # ============================================================
-def make_corner_plot(case_name, samples_df, truth, mu_tau, sig_tau, out_path, rng):
+def make_corner_plot(samples_df, truth, out_path, rng):
     import corner
 
     X = np.vstack([
@@ -353,103 +332,48 @@ def make_corner_plot(case_name, samples_df, truth, mu_tau, sig_tau, out_path, rn
     ]
     labels = [r"$\log_{10}(\lambda)$", r"$\log_{10}(\tau)$", r"$\log_{10}(\beta)$"]
 
+    # Keep corner clean; montage will label each subplot
     fig = corner.corner(
         Xp,
         labels=labels,
         truths=truths,
         quantiles=list(CORNER_QUANTILES),
-        show_titles=True,
-        title_fmt=".2f",
-        title_kwargs={"fontsize": 10},
+        show_titles=False,
         levels=CORNER_LEVELS,
         plot_datapoints=True,
         fill_contours=True,
         smooth=1.0,
         bins=30,
     )
-
-    if np.isfinite(mu_tau) and np.isfinite(sig_tau) and sig_tau > 0:
-        subtitle = rf"$\log(\tau)\sim \mathcal{{N}}({mu_tau:.2f}, {sig_tau:.2f}^2)$"
-    else:
-        subtitle = rf"$\tau \sim \mathrm{{Unif}}({TAU_BOUNDS[0]:.1g},{TAU_BOUNDS[1]:.1g})$"
-
-    fig.suptitle(f"{case_name} (truth lines)   |   {subtitle}", y=1.02)
     fig.tight_layout()
     fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
 
 
-def montage_images_vert(image_paths, out_path, title="Corner plots (stacked)"):
+def montage_images_row(image_paths, titles, out_path):
+    """
+    Place all corner plot PNGs in ONE ROW (ncols = n_images).
+    Adds a SUBPLOT TITLE for each case.
+    """
     if not image_paths:
         return
+    if len(image_paths) != len(titles):
+        raise ValueError("image_paths and titles must have the same length")
+
     imgs = [mpimg.imread(p) for p in image_paths]
     n = len(imgs)
 
-    fig, axes = plt.subplots(nrows=n, ncols=1, figsize=(8.5, 8.5 * n), dpi=DPI)
+    fig, axes = plt.subplots(nrows=1, ncols=n, figsize=(8.5 * n, 8.5), dpi=DPI)
     axes = np.atleast_1d(axes)
-    for ax, im in zip(axes, imgs):
+
+    for ax, im, ttl in zip(axes, imgs, titles):
         ax.imshow(im)
         ax.axis("off")
+        ax.set_title(str(ttl), fontsize=12)
 
-    fig.suptitle(title, y=0.995)
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
-
-
-# ============================================================
-# Tau prior wrapper
-# ============================================================
-def estimate_tau_prior(t, y_obs):
-    """
-    Returns (mu_tau, sig_tau, summary_row_dict).
-    If USE_TAU_PRIOR is False or estimation fails, returns (nan, nan, summary).
-    """
-    if not USE_TAU_PRIOR:
-        return np.nan, np.nan, {
-            "tau_prior_used": False,
-            "prior_mode": "disabled",
-        }
-
-    res = compute_tau_lognormal_prior(
-        t, y_obs,
-        tau_factor=TAU_PRIOR_FACTOR,
-        tau_bounds=TAU_BOUNDS,
-        smooth_lambda=TAU_EST_SMOOTH_LAMBDA,
-        solver="OSQP",
-        enforce_01=True,
-        dense=TAU_EST_DENSE,
-        peak_frac=TAU_EST_PEAK_FRAC,
-        exclude_boundaries=TAU_EST_EXCLUDE_BOUNDARIES,
-        boundary_eps_frac=TAU_EST_BOUNDARY_EPS_FRAC,
-        boundary_eps_abs=TAU_EST_BOUNDARY_EPS_ABS,
-        flat_ratio_threshold=TAU_EST_FLAT_RATIO_THRESHOLD,
-        early_eps_abs=EARLY_EPS_ABS,
-        early_eps_frac=EARLY_EPS_FRAC,
-        logsig=TAU_PRIOR_LOGSIG,
-        flat_logsig=TAU_PRIOR_LOGSIG_FLAT,
-        include_arrays=True,   # enables flat detection + adds diagnostic fields
-        t0_atol=T0_ATOL,
-    )
-
-    diag = res.diag or {}
-    row = {
-        "tau_prior_used": True,
-        "prior_mode": diag.get("prior_mode", ""),
-        "t1_first_pos_time": diag.get("t1", np.nan),
-        "t_star": diag.get("t_star", np.nan),
-        "t_star_repr": diag.get("t_star_repr", np.nan),
-        "tau0": diag.get("tau0", np.nan),
-        "mu_tau": diag.get("mu", res.mu),
-        "sig_tau": diag.get("sig", res.sig),
-        "dfdt_max": diag.get("dfdt_max", res.dfdt_max),
-        "flat_ratio": diag.get("flat_ratio", np.nan),
-        "smooth_lambda": diag.get("smooth_lambda", np.nan),
-        "smooth_method": diag.get("smooth_method", ""),
-        "qp_ok": diag.get("qp_ok", False),
-        "qp_status": diag.get("qp_status", ""),
-    }
-    return float(res.mu), float(res.sig), row
 
 
 # ============================================================
@@ -478,39 +402,21 @@ def main():
     print(f"Noise: main SD={NOISE_SD_MAIN}, t=0 SD={NOISE_SD_T0}")
     print(f"Inference assumes: SIGMA_MAIN={SIGMA_MAIN}, SIGMA_T0={SIGMA_T0}\n")
 
-    # --- Tau priors ---
-    tau_prior_rows = []
-    tau_prior_by_case = {}
-
-    for case_name in TRUE_CASES.keys():
-        y_obs = synthetic[case_name]["y_obs"]
-        mu_tau, sig_tau, row = estimate_tau_prior(t, y_obs)
-        row["Case"] = case_name
-        tau_prior_rows.append(row)
-        tau_prior_by_case[case_name] = (mu_tau, sig_tau)
-
-        if np.isfinite(mu_tau) and np.isfinite(sig_tau) and sig_tau > 0:
-            print(f"[tau prior] {case_name}: mode={row.get('prior_mode','')}  mu={mu_tau:.3f}  sig={sig_tau:.3f}  (tau0~{np.exp(mu_tau):.3g})")
-        else:
-            print(f"[tau prior] {case_name}: fallback to uniform(tau) in TAU_BOUNDS (mu/sig not finite)")
-
-    tau_prior_csv = os.path.join(OUT_DIR, "tau_prior_summary.csv")
-    pd.DataFrame(tau_prior_rows).to_csv(tau_prior_csv, index=False)
-    print(f"\nSaved tau prior summary: {tau_prior_csv}\n")
-
     # --- MCMC per case ---
     all_samples = {}
     accept = {}
     corner_paths = []
+    corner_titles = []
 
     for case_name in TRUE_CASES.keys():
         y_obs = synthetic[case_name]["y_obs"]
-        mu_tau, sig_tau = tau_prior_by_case[case_name]
 
-        print(f"[MCMC] {case_name}  points={len(t)}  |  tau prior: {'lognormal' if np.isfinite(mu_tau) else 'uniform'}")
-        sdf, acc = run_mcmc(t, y_obs, rng, case_name=case_name, mu_tau=mu_tau, sig_tau=sig_tau)
-        all_samples[case_name] = sdf
+        print(f"[MCMC] {case_name}  points={len(t)}  |  tau prior: uniform in bounds")
+        chain, acc = run_mcmc(t, y_obs, rng)
         accept[case_name] = acc
+
+        sdf = chain_to_df(chain, case_name, acc)
+        all_samples[case_name] = sdf
 
         out_samples = os.path.join(OUT_DIR, f"posterior_samples_{case_name}.csv")
         sdf.to_csv(out_samples, index=False)
@@ -519,29 +425,32 @@ def main():
 
         out_corner = os.path.join(OUT_DIR, f"corner_{case_name}.png")
         make_corner_plot(
-            case_name,
             sdf,
             synthetic[case_name]["truth"],
-            mu_tau=mu_tau,
-            sig_tau=sig_tau,
             out_path=out_corner,
             rng=np.random.default_rng(SEED + 1000 + (hash(case_name) % 10000)),
         )
         corner_paths.append(out_corner)
+        corner_titles.append(case_name)
         print(f"  saved corner -> {out_corner}\n")
 
-    out_montage = os.path.join(OUT_DIR, "corner_montage.png")
-    montage_images_vert(corner_paths, out_montage, title="Corner plots (truth shown as lines; tau prior annotated)")
+    # Montage corner plots in ONE ROW with subplot titles
+    out_montage = os.path.join(OUT_DIR, "corner_montage_row.png")
+    montage_images_row(corner_paths, corner_titles, out_montage)
     print(f"Saved montage: {out_montage}")
 
-    # --- Credible band plot ---
+    # --- Credible band plot: SUBPLOT TITLES contain case + params (estimated + true) ---
     fig, axes = plt.subplots(1, len(TRUE_CASES), figsize=(14.5, 4.2), dpi=DPI, sharey=True)
     axes = np.atleast_1d(axes)
 
     for ax, case_name in zip(axes, TRUE_CASES.keys()):
+        truth  = synthetic[case_name]["truth"]
         y_true = synthetic[case_name]["y_true"]
         y_obs  = synthetic[case_name]["y_obs"]
         sdf    = all_samples[case_name]
+
+        # posterior median params (for title)
+        lam_hat, tau_hat, beta_hat = posterior_medians(sdf)
 
         tmax = float(np.max(t))
         t_dense = np.linspace(0.0, tmax, T_DENSE)
@@ -562,26 +471,36 @@ def main():
 
         q_lo, q_med, q_hi = np.quantile(Ypred, [0.025, 0.5, 0.975], axis=0)
 
-        ax.fill_between(t_dense, q_lo, q_hi, alpha=0.25, label="95% credible band")
-        ax.plot(t_dense, q_med, lw=2.2, label="posterior median")
+        # plot
+        ax.fill_between(t_dense, q_lo, q_hi, alpha=0.25)
+        ax.plot(t_dense, q_med, lw=2.2)
+        ax.plot(t, y_obs, "o", ms=3.8, alpha=0.85)
+        ax.plot(t, y_true, lw=1.8, ls="--")
 
-        ax.plot(t, y_obs, "o", ms=3.8, alpha=0.85, label="synthetic data")
-        ax.plot(t, y_true, lw=1.8, ls="--", label="true curve")
-
-        ax.set_title(f"{case_name} (acc~{accept[case_name]:.2f})")
         ax.set_xlabel("time (min)")
         ax.set_ylim(0.0, 1.05)
 
+        # subplot title: label + parameter values
+        title = (
+            f"{case_name}\n"
+            rf"$\hat\lambda={fmt_g(lam_hat)}$ (true {fmt_g(truth['lam'])}), "
+            rf"$\hat\tau={fmt_g(tau_hat)}$ (true {fmt_g(truth['tau'])}), "
+            rf"$\hat\beta={fmt_g(beta_hat)}$ (true {fmt_g(truth['beta'])})"
+        )
+        ax.set_title(title, fontsize=10)
+
     axes[0].set_ylabel("release fraction")
-    axes[0].legend(frameon=True, fontsize=9, loc="best")
 
-    fig.suptitle(
-        rf"Posterior credible bands from parameter uncertainty "
-        rf"(assumed SD: t>0 {SIGMA_MAIN}, t=0 {SIGMA_T0})",
-        y=1.02
-    )
+    # legend once (proxy artists) — keeps titles clean
+    from matplotlib.lines import Line2D
+    proxy = [
+        Line2D([0], [0], lw=2.2),
+        Line2D([0], [0], lw=1.8, ls="--"),
+        Line2D([0], [0], marker="o", lw=0, ms=4),
+    ]
+    axes[0].legend(proxy, ["posterior median", "true curve", "data"], frameon=True, fontsize=9, loc="lower right")
+
     fig.tight_layout()
-
     out_bands = os.path.join(OUT_DIR, "fit_with_bands.png")
     fig.savefig(out_bands, bbox_inches="tight")
     plt.close(fig)
