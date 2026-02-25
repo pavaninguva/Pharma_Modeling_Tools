@@ -58,9 +58,9 @@ T0_ATOL    = 1e-12
 SEED = 42
 
 # ---- Parameter bounds (natural space) ----
-LAM_BOUNDS  = (1e-6, 1e2)
-TAU_BOUNDS  = (1e-6, 1e4)
-BETA_BOUNDS = (1e-4, 1e2)
+LAM_BOUNDS  = (1e-6, 1e1)
+TAU_BOUNDS  = (1e-6, 1e3)
+BETA_BOUNDS = (1e-4, 1e1)
 
 # ---- MCMC ----
 N_WALKERS = 48
